@@ -12,9 +12,10 @@ import json, os, subprocess, sys, time, urllib.request
 
 RPC = os.environ.get("RPC", "https://rpc.mainnet.chain.robinhood.com")
 PM = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
-HOOK = "0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7"
+HOOK = os.environ.get("HOOK") or json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "deployments/robinhood-4663-v2.json")))["staccLadder"]
 ETH = "0x0000000000000000000000000000000000000000"
 USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+JT = "0xA0Fc5a405772Fc80e977e0C1E9D20B95FE956c9e"
 ME = "0x26E8134eCC3af5cCE32f34B03E7BD2f318B25158".lower()
 TOKENS = os.environ.get(
     "TOKENS", "0xA0Fc5a405772Fc80e977e0C1E9D20B95FE956c9e 0x4cbCc4Eb02D7908B86627FBE434D09A506EC3522"
@@ -48,12 +49,16 @@ INIT = k("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)
 HOOKEV = {k(s): s.split("(")[0] for s in [
     "Reference(bytes32,address,uint8,uint256,uint256,uint256)", "Rebalanced(address,address,uint256,uint256)",
     "Shielded(address,bytes32,uint8,int24,int24)", "QuotesRebalanced(address,address,address,uint256)",
-    "TollSwept(address,uint256,uint256)", "Withdraw(address,address,uint256,address)", "Deposit(address,address,uint256)"]}
+    "TollSwept(address,uint256,uint256)", "Withdraw(address,address,uint256,address)", "Deposit(address,address,uint256)",
+    "Burned(address,uint256,uint256)"]}
 
 # family pool ids
 pools = {}
 for t in TOKENS:
-    for q, qn in ((ETH, "ETH"), (USDG, "USDG")):
+    qs = [(ETH, "ETH"), (USDG, "USDG")]
+    if t.lower() != JT.lower():
+        qs.append((JT, "JUSTTESTIN"))
+    for q, qn in qs:
         for tier in range(4):
             key = cast("call", HOOK, "familyKey(address,address,uint8)((address,address,uint24,int24,address),bool)",
                        t, q, str(tier), "--rpc-url", RPC).splitlines()[0]
@@ -105,7 +110,7 @@ while True:
                 tok_amt, q_amt = (a0, a1) if tok0 else (a1, a0)
                 side = "BUY " if tok_amt > 0 else "SELL"  # PoolManager delta is the swapper's: + = received
                 tx = rpc("eth_getTransactionByHash", [l["transactionHash"]])
-                emit(f"SWAP {side} {name}/{qn} {fee}: token {abs(tok_amt)/1e18:,.0f} quote {abs(q_amt)/(1e6 if qn=='USDG' else 1e18):.6f} "
+                emit(f"SWAP {side} {name}/{qn} {fee}: token {abs(tok_amt)/1e18:,.0f} quote {abs(q_amt)/(1e6 if qn=='USDG' else 1e18):,.6f} "
                      f"from {label(tx['from'])} via {label(tx['to'] or '')} tx {l['transactionHash'][:14]} blk {int(l['blockNumber'],16)}")
             for l in rpc("eth_getLogs", [{"address": HOOK, "fromBlock": frm, "toBlock": to}]):
                 ev = HOOKEV.get(l["topics"][0])
