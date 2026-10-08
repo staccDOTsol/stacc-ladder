@@ -59,7 +59,7 @@ for t in TOKENS:
                        t, q, str(tier), "--rpc-url", RPC).splitlines()[0]
             parts = [x.strip().split(" ")[0] for x in key.strip("()").split(",")]
             enc = cast("abi-encode", "f(address,address,uint24,int24,address)", *parts)
-            pools[k(enc).lower()] = (NAMES.get(t.lower(), t[:10]), qn, FEES[tier], t.lower() == parts[1].lower())
+            pools[k(enc).lower()] = (NAMES.get(t.lower(), t[:10]), qn, FEES[tier], t.lower() == parts[0].lower())
 
 
 def s128(h):
