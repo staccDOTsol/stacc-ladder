@@ -21,7 +21,7 @@ TOKENS = os.environ.get(
 ).split()
 NAMES = {"0xa0fc5a405772fc80e977e0c1e9d20b95fe956c9e": "JUSTTESTIN", "0x4cbcc4eb02d7908b86627fbe434d09a506ec3522": "ZERO"}
 FEES = {0: "0.3%", 1: "1%", 2: "3%", 3: "10%"}
-POLL = int(os.environ.get("POLL", "20"))
+POLL = int(os.environ.get("POLL", "30"))
 HEARTBEAT = int(os.environ.get("HEARTBEAT", "900"))
 
 
@@ -63,8 +63,8 @@ for t in TOKENS:
 
 
 def s128(h):
-    v = int(h, 16)
-    return v - (1 << 128) if v >= 1 << 127 else v
+    v = int(h, 16)  # int128 is sign-extended to a full word in the log data
+    return v - (1 << 256) if v >= 1 << 255 else v
 
 
 def label(addr):
