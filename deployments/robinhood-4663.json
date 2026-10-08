@@ -1,0 +1,16 @@
+{
+  "chainId": 4663,
+  "poolManager": "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+  "ladderLogic": "0x80Cb4F20E3d75Db82380827ABD5CD18a6aedfa36",
+  "staccLadder": "0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7",
+  "hookSalt": "0x4e6bfacb3b1e43322e65204c662ffccb98d13ddece21b831853729c3c6b4e196",
+  "owner": "0x26E8134eCC3af5cCE32f34B03E7BD2f318B25158",
+  "beneficiary": "0x26E8134eCC3af5cCE32f34B03E7BD2f318B25158",
+  "sinkBps": 0,
+  "quotes": { "ETH": "0x0000000000000000000000000000000000000000", "USDG": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" },
+  "usdgEthPool": { "fee": 460, "tickSpacing": 9, "hooks": "0x0000000000000000000000000000000000000000" },
+  "ponsFactory": "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e",
+  "tiers": [[3000,60],[10000,100],[30000,200],[100000,200]],
+  "params": "tau,horizon,feePerVol,widthMult,minWidth,maxWidth,maxDev,minVol,initVol,interval,quoteDriftBps,maxSlipBps,shieldMax,stepGas = (600,3600,20,300,600,60000,2000,50,1000,900,1000,100,16,8000000)",
+  "tokens": { "ZERO": { "token": "0x4cbCc4Eb02D7908B86627FBE434D09A506EC3522", "ponsCurve": "0x5C8610B3225Dc9fe9671B549E3a88a01961C9b3D" } }
+}
