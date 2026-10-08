@@ -12,8 +12,12 @@ import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {BalanceDelta, BalanceDeltaLibrary, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
-import {LadderLogic, IPonsCurve} from "./LadderLogic.sol";
-import {State, Tier, QuoteCfg, TokenRef, Pos, Family, Book, Due, Params, REF_PONS, REF_V4} from "./LadderTypes.sol";
+import {LadderLogic} from "./LadderLogic.sol";
+import {LadderRefs, IPonsCurve} from "./LadderRefs.sol";
+import {LadderRouter} from "./LadderRouter.sol";
+import {
+    State, Tier, QuoteCfg, TokenRef, Pos, Family, Book, Due, Params, RatchetCfg, BurnCfg, REF_PONS, REF_V4
+} from "./LadderTypes.sol";
 
 interface IERC20Min {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -64,11 +68,7 @@ contract StaccLadder is IHooks, IUnlockCallback {
     event QuoteListed(Currency indexed quote, PoolId ethPool);
     event TollSwept(Currency indexed currency, uint256 toBeneficiary, uint256 toSink);
 
-    /// @notice 10 bp per k^2, in pips (1e6 = 100%).
-    uint256 public constant FLOOR_PIPS = 1_000;
-    uint256 public constant CAP_PIPS = 1_000_000;
-    /// @notice References per token per block that pay nothing.
-    uint256 public constant K_FREE = 1;
+    uint256 public constant ONE_PIPS = 1_000_000;
     address public constant SINK = 0x000000000000000000000000000000000000dEaD;
 
     uint8 private constant KIND_SWAP = 0;
@@ -81,6 +81,7 @@ contract StaccLadder is IHooks, IUnlockCallback {
     uint8 private constant OP_QUOTES = 4;
     uint8 private constant OP_UNWIND = 5;
     uint8 private constant OP_SWEEP = 6;
+    uint8 private constant OP_BURN = 7;
 
     State internal s;
 
@@ -90,7 +91,9 @@ contract StaccLadder is IHooks, IUnlockCallback {
         address beneficiary_,
         uint16 sinkBps_,
         Tier[] memory tiers_,
-        Params memory p_
+        Params memory p_,
+        RatchetCfg memory rc_,
+        BurnCfg memory burn_
     ) {
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
         if (sinkBps_ > 10_000 || tiers_.length == 0) revert BadParams();
@@ -103,6 +106,8 @@ contract StaccLadder is IHooks, IUnlockCallback {
             s.tiers.push(tiers_[i]);
         }
         _setParams(p_);
+        _setRatchet(rc_);
+        _setBurn(burn_);
     }
 
     function getHookPermissions() public pure returns (Hooks.Permissions memory) {
@@ -174,6 +179,62 @@ contract StaccLadder is IHooks, IUnlockCallback {
 
     function transferOwnership(address o) external onlyOwner {
         s.owner = o;
+    }
+
+    /// @notice The fee ratchet's constants: floorPips * k^2 for the k-th reference, kFree free.
+    function setRatchet(RatchetCfg calldata rc_) external onlyOwner {
+        _setRatchet(rc_);
+    }
+
+    /// @notice The fee token (toll is converted to it and burned; every family also gets pools
+    ///         against it), the share of each toll burned, and the minimum burn size in ETH.
+    function setBurn(BurnCfg calldata b_) external onlyOwner {
+        _setBurn(b_);
+    }
+
+    /// @notice Replace the fee tiers (ascending fees). Books track their own pools, so positions
+    ///         in a dropped tier stay reachable by unwind and rebalance.
+    function setTiers(Tier[] calldata tiers_) external onlyOwner {
+        if (tiers_.length == 0) revert BadParams();
+        delete s.tiers;
+        for (uint256 i; i < tiers_.length; ++i) {
+            if (i > 0 && tiers_[i].fee <= tiers_[i - 1].fee) revert BadParams();
+            s.tiers.push(tiers_[i]);
+        }
+    }
+
+    function delistQuote(Currency q) external onlyOwner {
+        if (!s.quotes[q].listed) return;
+        delete s.quotes[q];
+        uint256 n = s.quoteList.length;
+        for (uint256 i; i < n; ++i) {
+            if (s.quoteList[i] == q) {
+                s.quoteList[i] = s.quoteList[n - 1];
+                s.quoteList.pop();
+                break;
+            }
+        }
+    }
+
+    /// @notice Point a token at a Pons curve directly (no factory allowlist check).
+    function setPonsRef(address token, address curve) external onlyOwner {
+        PoolKey memory none;
+        s.refs[token] = TokenRef({kind: REF_PONS, curve: curve, pool: none});
+        emit RefSet(token, REF_PONS, curve, none.toId());
+    }
+
+    function clearRef(address token) external onlyOwner {
+        delete s.refs[token];
+    }
+
+    function _setRatchet(RatchetCfg memory rc_) private {
+        if (rc_.capPips > ONE_PIPS) revert BadParams();
+        s.rc = rc_;
+    }
+
+    function _setBurn(BurnCfg memory b_) private {
+        if (b_.burnBps > 10_000) revert BadParams();
+        s.burn = b_;
     }
 
     function _setParams(Params memory p_) private {
@@ -248,7 +309,8 @@ contract StaccLadder is IHooks, IUnlockCallback {
             if (s.refs[tokens[i]].kind == 0) revert BadRef();
         }
         for (uint256 j; j < quotes.length; ++j) {
-            if (!quotes[j].isAddressZero() && !s.quotes[quotes[j]].listed) revert BadQuote();
+            Currency q = quotes[j];
+            if (!q.isAddressZero() && !s.quotes[q].listed && Currency.unwrap(q) != s.burn.token) revert BadQuote();
         }
         b.tokens = tokens;
         b.quotes = quotes;
@@ -299,8 +361,14 @@ contract StaccLadder is IHooks, IUnlockCallback {
         s.pm.unlock(abi.encode(OP_QUOTES, book, Currency.wrap(address(0)), 0, address(0)));
     }
 
+    /// @notice Pay a currency's beneficiary share of toll out (sinkBps of it to 0xdead).
     function sweepToll(Currency c) external {
         s.pm.unlock(abi.encode(OP_SWEEP, address(0), c, 0, address(0)));
+    }
+
+    /// @notice Convert a currency's pending burn share of toll into the fee token and burn it.
+    function burnToll(Currency c) external {
+        s.pm.unlock(abi.encode(OP_BURN, address(0), c, 0, address(0)));
     }
 
     function _authBook(address book) private view {
@@ -321,12 +389,12 @@ contract StaccLadder is IHooks, IUnlockCallback {
             s.pm.mint(address(this), c.toId(), amount);
             Book storage b = s.books[bk];
             b.bal[c] += amount;
-            if (_isQuote(c)) b.quoteTotal[c] += int256(amount);
+            if (_isBookQuote(c)) b.quoteTotal[c] += int256(amount);
             emit Deposit(bk, c, amount);
         } else if (op == OP_WITHDRAW) {
             Book storage b = s.books[bk];
             b.bal[c] -= amount;
-            if (_isQuote(c)) b.quoteTotal[c] -= int256(amount);
+            if (_isBookQuote(c)) b.quoteTotal[c] -= int256(amount);
             s.pm.burn(address(this), c.toId(), amount);
             s.pm.take(c, to, amount);
             emit Withdraw(bk, c, amount, to);
@@ -336,6 +404,8 @@ contract StaccLadder is IHooks, IUnlockCallback {
             LadderLogic.rebalanceQuotes(s, bk);
         } else if (op == OP_UNWIND) {
             LadderLogic.unwind(s, bk, Currency.unwrap(c));
+        } else if (op == OP_BURN) {
+            LadderRouter.burnStep(s, c);
         } else if (op == OP_SWEEP) {
             uint256 t = s.toll[c];
             s.toll[c] = 0;
@@ -352,13 +422,18 @@ contract StaccLadder is IHooks, IUnlockCallback {
         return c.isAddressZero() || s.quotes[c].listed;
     }
 
+    function _isBookQuote(Currency c) private view returns (bool) {
+        return _isQuote(c) || (s.burn.token != address(0) && Currency.unwrap(c) == s.burn.token);
+    }
+
     // ───────────────────────────── the ratchet ─────────────────────────────
 
     /// @notice Toll rate for the k-th reference to a token in a block.
-    function ratchetPips(uint256 k) public pure returns (uint256) {
-        if (k <= K_FREE) return 0;
-        uint256 r = FLOOR_PIPS * k * k;
-        return r > CAP_PIPS ? CAP_PIPS : r;
+    function ratchetPips(uint256 k) public view returns (uint256) {
+        RatchetCfg memory rc = s.rc;
+        if (k <= rc.kFree) return 0;
+        uint256 r = uint256(rc.floorPips) * k * k;
+        return r > rc.capPips ? rc.capPips : r;
     }
 
     /// @notice References to `token` so far in this block.
@@ -388,7 +463,13 @@ contract StaccLadder is IHooks, IUnlockCallback {
     function _take(Currency c, uint256 amt) private {
         if (amt == 0) return;
         s.pm.mint(address(this), c.toId(), amt);
-        s.toll[c] += amt;
+        uint256 toBurn = s.burn.token == address(0) ? 0 : amt * s.burn.burnBps / 10_000;
+        s.burnable[c] += toBurn;
+        s.toll[c] += amt - toBurn;
+        if (!s.isTollCurrency[c]) {
+            s.isTollCurrency[c] = true;
+            s.tollCurrencies.push(c);
+        }
     }
 
     function _abs(int128 a) private pure returns (uint256) {
@@ -462,8 +543,8 @@ contract StaccLadder is IHooks, IUnlockCallback {
         k += extra;
         uint256 r = ratchetPips(k);
         BalanceDelta principal = delta - fees;
-        uint256 t0 = _abs(principal.amount0()) * r / CAP_PIPS;
-        uint256 t1 = _abs(principal.amount1()) * r / CAP_PIPS;
+        uint256 t0 = _abs(principal.amount0()) * r / ONE_PIPS;
+        uint256 t1 = _abs(principal.amount1()) * r / ONE_PIPS;
         _take(key.currency0, t0);
         _take(key.currency1, t1);
         emit Reference(id, token, kind, k, t0, t1);
@@ -496,12 +577,13 @@ contract StaccLadder is IHooks, IUnlockCallback {
         if (k != 0) {
             bool specifiedIs0 = (params.amountSpecified < 0) == params.zeroForOne;
             int128 unspecified = specifiedIs0 ? delta.amount1() : delta.amount0();
-            t = _abs(unspecified) * ratchetPips(k) / CAP_PIPS;
+            t = _abs(unspecified) * ratchetPips(k) / ONE_PIPS;
             Currency c = specifiedIs0 ? key.currency1 : key.currency0;
             _take(c, t);
             emit Reference(key.toId(), token, KIND_SWAP, k, specifiedIs0 ? 0 : t, specifiedIs0 ? t : 0);
         }
         if (s.due.length != 0) _step(abi.encodeCall(this.stepAuto, ()));
+        if (s.tollCurrencies.length != 0) _step(abi.encodeCall(this.stepBurn, ()));
         return (IHooks.afterSwap.selector, int128(int256(t)));
     }
 
@@ -520,6 +602,10 @@ contract StaccLadder is IHooks, IUnlockCallback {
 
     function stepAuto() external onlySelf {
         LadderLogic.autoStep(s);
+    }
+
+    function stepBurn() external onlySelf {
+        LadderRouter.nextBurn(s);
     }
 
     function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
@@ -561,11 +647,27 @@ contract StaccLadder is IHooks, IUnlockCallback {
     }
 
     function pairTick(address token, Currency q) external view returns (int24, bool) {
-        return LadderLogic.pairTick(s, token, q);
+        return LadderRefs.pairTick(s, token, q);
     }
 
     function sigma(address token, Currency q) external view returns (uint256) {
-        return LadderLogic.sigmaOf(s, token, q);
+        return LadderRefs.sigmaOf(s, token, q);
+    }
+
+    function ratchetCfg() external view returns (RatchetCfg memory) {
+        return s.rc;
+    }
+
+    function burnCfg() external view returns (BurnCfg memory) {
+        return s.burn;
+    }
+
+    function burnableOf(Currency c) external view returns (uint256) {
+        return s.burnable[c];
+    }
+
+    function bookPools(address who) external view returns (PoolId[] memory) {
+        return s.books[who].pools;
     }
 
     function familyKey(address token, Currency q, uint8 tier) external view returns (PoolKey memory key, bool tokenIs0) {

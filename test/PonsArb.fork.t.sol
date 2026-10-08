@@ -16,7 +16,7 @@ import {Router, IERC20T} from "./Router.sol";
 contract PonsArbForkTest is Test {
     IPoolManager pm = Config.PM;
     address constant ME = 0x26E8134eCC3af5cCE32f34B03E7BD2f318B25158;
-    StaccLadder constant HOOK = StaccLadder(payable(0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7));
+    StaccLadder constant HOOK = StaccLadder(payable(0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7)); // v1 live
     PonsArb arb;
     Router router;
 

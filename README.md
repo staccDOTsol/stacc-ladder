@@ -4,7 +4,41 @@ A Uniswap v4 hook on Robinhood Chain (4663). For every token it trades, it opens
 
 **ALPHA. Unaudited. Funds can be lost. Use amounts you can afford to lose.**
 
-## Live on Robinhood Chain
+## v2 (live, current)
+
+| | |
+|---|---|
+| StaccLadder v2 (hook) | [`0xFCd182416cA91A9e88E9fe44e4F78EA3Cb2C15c7`](https://robin.etherscan.io/address/0xFCd182416cA91A9e88E9fe44e4F78EA3Cb2C15c7#code) |
+| LadderLogic | `0x8E80F195995756B43AED6223706E9C4A90C4B068` |
+| LadderRouter | `0x7E2Dd435Cfb1c0EbA586ac14E1643f343Cd753c3` |
+| LadderRefs | `0xC629de8CEdA988bDc7970f83368b2bE951426735` |
+| Fee token | JUSTTESTIN [`0xA0Fc5a405772Fc80e977e0C1E9D20B95FE956c9e`](https://ponsfamily.com/launchpad/0xa0fc5a405772fc80e977e0c1e9d20b95fe956c9e) |
+
+The full record is in [`deployments/robinhood-4663-v2.json`](deployments/robinhood-4663-v2.json). Source is on Sourcify.
+
+**What changed from v1, and why.** v1 ran with the shield off so that arbers could trade. A backtest over 9 real Pons curve histories (`bt/`) showed that this gives away the whole stale gap: about -80% against simply holding over a token's life. v2 keeps the shield on but lets a range sit up to (pool fee + `tipTicks`) on the taker's side of the reference. Arbers always have a capped edge, and nothing staler can be picked off. On the same histories, the best capped-edge setup ran a mean of +53% against holding, with a median of +15%, and beat holding on 78% of tokens. That setup is 1% fee, 3% extra edge, ~35% ranges, and no timed re-lay.
+
+- **Shield with a capped edge.** Before each swap into a pool that holds books, ranges the reference has run past move back to (reference -/+ (pool fee + tipTicks)). The default tip is 300 ticks (3%). A swap must carry `stepGas + 150k` gas.
+- **The fee token (JUSTTESTIN).**
+  - Every token family also gets pools against it, at every tier. It is a quote for every family, priced through its own reference.
+  - Toll is split by `burnBps` (default 100% to burn). The burn share is converted to ETH and buys JUSTTESTIN, which goes to `0xdead`, in the same transaction. Before graduation the purchase goes through its Pons curve; after, through the Uniswap pool Pons seeded.
+  - The burn runs as a bounded step after each swap, or through `burnToll(currency)`, which anyone can call. Every leg is checked against the smoothed reference from earlier blocks, so a pushed price makes the burn wait instead of fill.
+- **Fee ratchet constants are configurable** (`setRatchet`): floor 10 bp x k^2, first reference free, cap 100%. JUSTTESTIN ratchets like any token.
+- **Owner setters across the whole hook.** These cover:
+  - `setParams`, `setRatchet`, `setBurn`, `setTiers`;
+  - `listQuote` (owner can re-point), `delistQuote`;
+  - `setRef`, `setPonsRef`, `clearRef`, `setPonsFactory`;
+  - `setBeneficiary`, `transferOwnership`.
+
+  The owner can never move a book's funds.
+- **Books track their own pools.** `unwind` and re-lays reach every position, even after the tier list changes.
+- **Defaults:** tau 60 s, feePerVol 5 (typical volatility lands in the 1% tier), ranges 2000..5000 ticks, re-lay daily, shield on (16 books per swap), tip 300 ticks.
+
+**Migrating a book from v1:** `KEY_FILE=... ./migrate.sh`. It sweeps your v1 toll, unwinds, withdraws everything, sets the v2 book, deposits and lays it. Add `DRY=1` first to see the plan.
+
+v1 below stays deployed. It is no longer the target for books.
+
+## v1 (superseded)
 
 | | |
 |---|---|

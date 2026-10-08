@@ -11,17 +11,12 @@ import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {LiquidityAmounts} from "v4-periphery/libraries/LiquidityAmounts.sol";
+import {LadderRefs, IPonsCurve} from "./LadderRefs.sol";
+import {LadderRouter} from "./LadderRouter.sol";
 import {
     State, Tier, QuoteCfg, TokenRef, Obs, Pos, Family, Book, Due, Params, REF_PONS, REF_V4
 } from "./LadderTypes.sol";
 
-interface IPonsCurve {
-    function token() external view returns (address);
-    function factory() external view returns (address);
-    function pairToken() external view returns (address);
-    function graduated() external view returns (bool);
-    function getReserves() external view returns (uint256 quoteReserve, uint256 tokenReserve);
-}
 
 /// @title LadderLogic: references, volatility, placement, rebalancing and the shield.
 /// @notice Linked library; every external function runs against the hook's storage by
@@ -47,167 +42,6 @@ library LadderLogic {
     event FamilyPool(address indexed token, Currency indexed quote, uint8 tier, PoolId id);
 
     Currency internal constant ETH = Currency.wrap(address(0));
-    uint256 internal constant ONE = 1e18;
-
-    // ───────────────────────────── references ─────────────────────────────
-
-    /// @dev log_1.0001(num / den), clamped to the usable tick range.
-    function _tickFromRatio(uint256 num, uint256 den) private pure returns (int256) {
-        if (num == 0) return TickMath.MIN_TICK + 1;
-        if (den == 0 || num / den >= (1 << 63)) return TickMath.MAX_TICK - 1;
-        uint256 pX192 = FullMath.mulDiv(num, 1 << 192, den);
-        uint256 sq = _sqrt(pX192);
-        if (sq < TickMath.MIN_SQRT_PRICE) return TickMath.MIN_TICK + 1;
-        if (sq >= TickMath.MAX_SQRT_PRICE) return TickMath.MAX_TICK - 1;
-        return TickMath.getTickAtSqrtPrice(uint160(sq));
-    }
-
-    function _sqrt(uint256 x) private pure returns (uint256 z) {
-        if (x == 0) return 0;
-        z = x;
-        uint256 y = (x >> 1) + 1;
-        if (y < z) {
-            z = y;
-            y = (x / y + y) >> 1;
-            while (y < z) {
-                z = y;
-                y = (x / y + y) >> 1;
-            }
-        }
-    }
-
-    /// @dev Tick of "ETH per one unit of quote c". ETH is 0; a listed quote reads its ETH pool.
-    function _quoteEthTick(State storage s, Currency c) private view returns (int256, bool) {
-        if (c.isAddressZero()) return (0, true);
-        QuoteCfg storage q = s.quotes[c];
-        if (!q.listed) return (0, false);
-        (uint160 sp, int24 t,,) = s.pm.getSlot0(q.ethPool.toId());
-        if (sp == 0) return (0, false);
-        return (-int256(t), true); // pool tick is quote per ETH
-    }
-
-    /// @dev Tick of "ETH per one unit of token": quotes directly, tokens through their reference.
-    function _ethTick(State storage s, address token) private view returns (int256, bool) {
-        Currency c = Currency.wrap(token);
-        if (c.isAddressZero() || s.quotes[c].listed) return _quoteEthTick(s, c);
-        TokenRef storage r = s.refs[token];
-        if (r.kind == REF_PONS) {
-            IPonsCurve curve = IPonsCurve(r.curve);
-            if (curve.graduated()) return _ponsPoolTick(s, curve, token);
-            (uint256 qr, uint256 tr) = curve.getReserves();
-            int256 t = _tickFromRatio(qr, tr); // pairToken per token
-            (int256 pt, bool ok) = _quoteEthTick(s, Currency.wrap(curve.pairToken()));
-            return (t + pt, ok);
-        }
-        if (r.kind == REF_V4) {
-            (uint160 sp, int24 pt,,) = s.pm.getSlot0(r.pool.toId());
-            if (sp == 0) return (0, false);
-            bool tokenIs0 = Currency.unwrap(r.pool.currency0) == token;
-            Currency other = tokenIs0 ? r.pool.currency1 : r.pool.currency0;
-            (int256 ot, bool ok) = _quoteEthTick(s, other);
-            return ((tokenIs0 ? int256(pt) : -int256(pt)) + ot, ok);
-        }
-        return (0, false);
-    }
-
-    /// @dev After graduation: the Uniswap pool Pons seeded, read from the factory's launch record
-    ///      (token, curve, deployer, feeRecipient, pairToken, threshold, poolFee, tickSpacing, ...)
-    ///      on Pons's meme hook. Unavailable until that pool holds liquidity.
-    function _ponsPoolTick(State storage s, IPonsCurve curve, address token) private view returns (int256, bool) {
-        (bool ok, PoolKey memory key) = ponsPoolKey(curve, token);
-        if (!ok) return (0, false);
-        (uint160 sp, int24 pt,,) = s.pm.getSlot0(key.toId());
-        if (sp == 0 || s.pm.getLiquidity(key.toId()) == 0) return (0, false);
-        bool tokenIs0 = Currency.unwrap(key.currency0) == token;
-        Currency pair = tokenIs0 ? key.currency1 : key.currency0;
-        (int256 ot, bool okq) = _quoteEthTick(s, pair);
-        return ((tokenIs0 ? int256(pt) : -int256(pt)) + ot, okq);
-    }
-
-    function ponsPoolKey(IPonsCurve curve, address token) public view returns (bool, PoolKey memory key) {
-        address f = curve.factory();
-        (bool ok, bytes memory r) = f.staticcall(abi.encodeWithSignature("getLaunchedToken(address)", token));
-        if (!ok || r.length < 256) return (false, key);
-        (,,,, address pair,, uint256 fee, int256 ts) =
-            abi.decode(r, (address, address, address, address, address, uint256, uint256, int256));
-        bytes memory h;
-        (ok, h) = f.staticcall(abi.encodeWithSignature("memeHook()"));
-        if (!ok || h.length < 32 || fee > type(uint24).max || ts <= 0 || ts > type(int16).max) return (false, key);
-        bool pairFirst = pair < token;
-        key = PoolKey({
-            currency0: Currency.wrap(pairFirst ? pair : token),
-            currency1: Currency.wrap(pairFirst ? token : pair),
-            fee: uint24(fee),
-            tickSpacing: int24(ts),
-            hooks: IHooks(abi.decode(h, (address)))
-        });
-        return (true, key);
-    }
-
-    /// @notice Live tick of "quote per token" (log_1.0001), from the token's reference.
-    function pairTick(State storage s, address token, Currency q) public view returns (int24, bool) {
-        (int256 a, bool okA) = _ethTick(s, token);
-        (int256 b, bool okB) = _quoteEthTick(s, q);
-        if (!okA || !okB) return (0, false);
-        int256 t = a - b;
-        if (t <= TickMath.MIN_TICK) t = TickMath.MIN_TICK + 1;
-        if (t >= TickMath.MAX_TICK) t = TickMath.MAX_TICK - 1;
-        return (int24(t), true);
-    }
-
-    function _obsKey(address token, Currency q) private pure returns (bytes32) {
-        return keccak256(abi.encode(token, q));
-    }
-
-    /// @dev Record the live reference at most once per block and return
-    ///      (live, smoothed-before-this-block, horizon sigma in ticks, ok).
-    function _observe(State storage s, address token, Currency q)
-        private
-        returns (int24 live, int24 sPrev, uint256 sigma, bool ok)
-    {
-        (live, ok) = pairTick(s, token, q);
-        if (!ok) return (0, 0, 0, false);
-        Obs storage o = s.obs[_obsKey(token, q)];
-        Params storage p = s.p;
-        if (o.time == 0) {
-            o.blk = uint64(block.number);
-            o.time = uint64(block.timestamp);
-            o.last = live;
-            o.sPrev = live;
-            o.sCur = live;
-            uint256 iv = uint256(uint24(p.initVol));
-            o.varRate = uint128(iv * iv * 1e6 / p.horizon);
-        } else if (o.blk != block.number) {
-            o.sPrev = o.sCur;
-            uint256 dt = block.timestamp - o.time;
-            if (dt > 0) {
-                uint256 a = dt * ONE / (dt + p.tau);
-                o.sCur = int24(int256(o.sCur) + (int256(live) - int256(o.sCur)) * int256(a) / int256(ONE));
-                int256 r = int256(live) - int256(o.last);
-                uint256 inst = uint256(r * r) * 1e6 / dt;
-                uint256 v = o.varRate;
-                v = inst > v ? v + (inst - v) * a / ONE : v - (v - inst) * a / ONE;
-                o.varRate = uint128(v > type(uint128).max ? type(uint128).max : v);
-                o.last = live;
-                o.time = uint64(block.timestamp);
-            }
-            o.blk = uint64(block.number);
-        }
-        sPrev = o.sPrev;
-        sigma = _sigma(s, o);
-    }
-
-    function _sigma(State storage s, Obs storage o) private view returns (uint256 sig) {
-        if (o.time == 0) return uint256(uint24(s.p.initVol));
-        sig = _sqrt(uint256(o.varRate) * s.p.horizon / 1e6);
-        uint256 floor = uint256(uint24(s.p.minVol));
-        if (sig < floor) sig = floor;
-    }
-
-    /// @notice Horizon sigma of a pair from stored observations (no update).
-    function sigmaOf(State storage s, address token, Currency q) public view returns (uint256) {
-        return _sigma(s, s.obs[_obsKey(token, q)]);
-    }
 
     // ───────────────────────────── families ─────────────────────────────
 
@@ -249,6 +83,7 @@ library LadderLogic {
         for (uint8 i; i < n; ++i) {
             if (s.tiers[i].fee == key.fee && s.tiers[i].spacing == key.tickSpacing) {
                 s.fam[id] = Family({known: true, tokenIs0: tokenIs0, tier: i, token: token, quote: q});
+                s.keyOf[id] = key;
                 emit FamilyPool(token, q, i, id);
                 return true;
             }
@@ -257,7 +92,8 @@ library LadderLogic {
     }
 
     function _isQuote(State storage s, Currency c) private view returns (bool) {
-        return c.isAddressZero() || s.quotes[c].listed;
+        return c.isAddressZero() || s.quotes[c].listed
+            || (s.burn.token != address(0) && Currency.unwrap(c) == s.burn.token);
     }
 
     /// @notice Initialize every missing (token, quote, tier) pool at the live reference price.
@@ -267,11 +103,13 @@ library LadderLogic {
         for (uint256 j; j <= nq; ++j) {
             openPair(s, token, j == 0 ? ETH : s.quoteList[j - 1]);
         }
+        address ft = s.burn.token;
+        if (ft != address(0) && ft != token && s.refs[ft].kind != 0) openPair(s, token, Currency.wrap(ft));
     }
 
     /// @notice Initialize every missing tier of one (token, quote) pair at the live reference.
     function openPair(State storage s, address token, Currency q) public {
-        (int24 live, bool ok) = pairTick(s, token, q);
+        (int24 live, bool ok) = LadderRefs.pairTick(s, token, q);
         if (!ok) return;
         for (uint8 t; t < s.tiers.length; ++t) {
             _ensurePool(s, token, q, t, live);
@@ -299,6 +137,7 @@ library LadderLogic {
             poolTick = s.pm.initialize(key, TickMath.getSqrtPriceAtTick(t));
         }
         if (!s.fam[id].known) register(s, key);
+        s.keyOf[id] = key;
     }
 
     // ───────────────────────────── positions ─────────────────────────────
@@ -336,6 +175,9 @@ library LadderLogic {
         if (s.poolBookIdx[id][book] != 0) return;
         s.poolBooks[id].push(book);
         s.poolBookIdx[id][book] = s.poolBooks[id].length;
+        Book storage b = s.books[book];
+        b.pools.push(id);
+        b.poolIdx[id] = b.pools.length;
     }
 
     function _unlist(State storage s, PoolId id, address book) private {
@@ -347,6 +189,38 @@ library LadderLogic {
         s.poolBookIdx[id][last] = i;
         l.pop();
         delete s.poolBookIdx[id][book];
+        Book storage b = s.books[book];
+        uint256 j = b.poolIdx[id];
+        if (j != 0) {
+            PoolId lastId = b.pools[b.pools.length - 1];
+            b.pools[j - 1] = lastId;
+            b.poolIdx[lastId] = j;
+            b.pools.pop();
+            delete b.poolIdx[id];
+        }
+    }
+
+    /// @dev Pull both sides of every position the book holds for `token` on the quotes marked ok
+    ///      (all quotes when `quotes` is empty). Walks the book's own pool list, so it reaches
+    ///      every position whatever the tier list says now.
+    function _pullToken(State storage s, address book, address token, Currency[] memory quotes, bool[] memory ok)
+        private
+    {
+        PoolId[] memory ids = s.books[book].pools;
+        for (uint256 i; i < ids.length; ++i) {
+            Family storage f = s.fam[ids[i]];
+            if (token != address(0) && f.token != token) continue;
+            if (quotes.length != 0) {
+                bool hit;
+                for (uint256 j; j < quotes.length; ++j) {
+                    if (ok[j] && quotes[j] == f.quote) hit = true;
+                }
+                if (!hit) continue;
+            }
+            PoolKey memory key = s.keyOf[ids[i]];
+            _pull(s, book, key, 0);
+            _pull(s, book, key, 1);
+        }
     }
 
     /// @dev Remove a book's whole position on one side; returns what came back (principal + fees).
@@ -458,7 +332,7 @@ library LadderLogic {
         for (uint256 j; j < nq; ++j) {
             PairPlan memory pp = plan[j];
             pp.q = b.quotes[j];
-            (pp.live, pp.sPrev, pp.sigma, pp.ok) = _observe(s, token, pp.q);
+            (pp.live, pp.sPrev, pp.sigma, pp.ok) = LadderRefs.observe(s, token, pp.q);
             if (pp.ok) {
                 int256 dev = int256(pp.live) - int256(pp.sPrev);
                 if (dev < 0) dev = -dev;
@@ -469,13 +343,14 @@ library LadderLogic {
         if (sumSig == 0) return false;
 
         // Bring the token's liquidity home on every pair we are about to re-lay.
-        for (uint256 j; j < nq; ++j) {
-            if (!plan[j].ok) continue;
-            for (uint8 t; t < s.tiers.length; ++t) {
-                (PoolKey memory key,) = familyKey(s, token, plan[j].q, t);
-                _pull(s, book, key, 0);
-                _pull(s, book, key, 1);
+        {
+            Currency[] memory qs = new Currency[](nq);
+            bool[] memory oks = new bool[](nq);
+            for (uint256 j; j < nq; ++j) {
+                qs[j] = plan[j].q;
+                oks[j] = plan[j].ok;
             }
+            _pullToken(s, book, token, qs, oks);
         }
 
         uint256 tokenTotal = b.bal[Currency.wrap(token)];
@@ -514,7 +389,7 @@ library LadderLogic {
         uint256 nt = b.tokens.length;
         for (uint256 i; i < nt; ++i) {
             address t = b.tokens[i];
-            total += t == token ? pp.sigma : sigmaOf(s, t, pp.q);
+            total += t == token ? pp.sigma : LadderRefs.sigmaOf(s, t, pp.q);
         }
         if (total == 0) return 0;
         uint256 target = (b.bal[pp.q] + b.locked[pp.q]) * pp.sigma / total;
@@ -536,8 +411,8 @@ library LadderLogic {
         int256 w = int256(uint256(s.p.widthMult)) * int256(pp.sigma) / 100;
         if (w < s.p.minWidth) w = s.p.minWidth;
         if (w > s.p.maxWidth) w = s.p.maxWidth;
-        int24 askRef = _max(pp.live, pp.sPrev);
-        int24 bidRef = _min(pp.live, pp.sPrev);
+        int24 askRef = _max(pp.live, pp.sPrev) + s.p.offsetTicks;
+        int24 bidRef = _min(pp.live, pp.sPrev) - s.p.offsetTicks;
         uint256 xHi = xq * wHi / 1e4;
         uint256 qHi = qq * wHi / 1e4;
         (uint256 a, uint256 c) = _layTier(s, book, token, pp, kLo, xq - xHi, qq - qHi, askRef, bidRef, int24(w));
@@ -594,15 +469,9 @@ library LadderLogic {
     }
 
     /// @notice Pull every position of one token in one book back to free balance.
+    /// @notice Pull every position of one token (or of all tokens, token 0) back to free balance.
     function unwind(State storage s, address book, address token) external {
-        Book storage b = s.books[book];
-        for (uint256 j; j < b.quotes.length; ++j) {
-            for (uint8 t; t < s.tiers.length; ++t) {
-                (PoolKey memory key,) = familyKey(s, token, b.quotes[j], t);
-                _pull(s, book, key, 0);
-                _pull(s, book, key, 1);
-            }
-        }
+        _pullToken(s, book, token, new Currency[](0), new bool[](0));
     }
 
     // ───────────────────────────── quote mix ─────────────────────────────
@@ -621,14 +490,14 @@ library LadderLogic {
         for (uint256 j; j < nq; ++j) {
             Currency q = b.quotes[j];
             if (!q.isAddressZero()) {
-                (int24 live, int24 sPrev,, bool ok) = _observe(s, Currency.unwrap(q), ETH);
+                (int24 live, int24 sPrev,, bool ok) = LadderRefs.observe(s, Currency.unwrap(q), ETH);
                 if (!ok) return false;
                 refT[j] = _min(live, sPrev);
             }
             val[j] = _toEth(b.bal[q] + b.locked[q], refT[j]);
             vTot += val[j];
             for (uint256 i; i < b.tokens.length; ++i) {
-                wt[j] += sigmaOf(s, b.tokens[i], q);
+                wt[j] += LadderRefs.sigmaOf(s, b.tokens[i], q);
             }
             wTot += wt[j];
         }
@@ -649,8 +518,10 @@ library LadderLogic {
         uint256 amtIn = _fromEth(move, refT[over]);
         if (amtIn > b.bal[qo]) amtIn = b.bal[qo];
         if (amtIn == 0) return false;
-        uint256 got = qo.isAddressZero() ? amtIn : _swapVsEth(s, b, qo, amtIn, false);
-        if (!qu.isAddressZero() && got != 0) _swapVsEth(s, b, qu, got, true);
+        (uint256 eth, uint256 used) = LadderRouter.toEth(s, qo, amtIn);
+        b.bal[qo] -= used;
+        uint256 got = LadderRouter.fromEth(s, qu, eth, address(this));
+        b.bal[qu] += got;
         emit QuotesRebalanced(book, qo, qu, amtIn);
         return true;
     }
@@ -667,36 +538,6 @@ library LadderLogic {
         return FullMath.mulDiv(FullMath.mulDiv(eth, 1 << 96, sp), 1 << 96, sp);
     }
 
-    /// @dev Exact-in swap on a quote's ETH pool (ETH is currency0). buyQuote: ETH -> q.
-    ///      The price limit keeps the fill within maxSlipBps of the better of live and smoothed.
-    function _swapVsEth(State storage s, Book storage b, Currency q, uint256 amtIn, bool buyQuote)
-        private
-        returns (uint256 out)
-    {
-        PoolKey memory key = s.quotes[q].ethPool;
-        (, int24 poolTick,,) = s.pm.getSlot0(key.toId());
-        Obs storage o = s.obs[_obsKey(Currency.unwrap(q), ETH)];
-        // pool tick = q per ETH = -(ETH per q)
-        int24 a = -o.sPrev;
-        int24 slip = int24(uint24(s.p.maxSlipBps));
-        uint160 limit;
-        if (buyQuote) {
-            // ETH -> q is zeroForOne: price falls; stop below the better of pool and smoothed
-            limit = TickMath.getSqrtPriceAtTick(_clamp(_max(poolTick, a) - slip, 1));
-        } else {
-            limit = TickMath.getSqrtPriceAtTick(_clamp(_min(poolTick, a) + slip, 1));
-        }
-        BalanceDelta d = s.pm.swap(
-            key,
-            IPoolManager.SwapParams({zeroForOne: buyQuote, amountSpecified: -int256(amtIn), sqrtPriceLimitX96: limit}),
-            ""
-        );
-        _settle(s, b, key.currency0, d.amount0());
-        _settle(s, b, key.currency1, d.amount1());
-        int128 o1 = buyQuote ? d.amount1() : d.amount0();
-        out = o1 > 0 ? uint256(uint128(o1)) : 0;
-    }
-
     // ───────────────────────────── in-swap steps ─────────────────────────────
 
     /// @notice Before a swap: move books' single-sided ranges in this pool that sit on the
@@ -708,7 +549,7 @@ library LadderLogic {
         address[] storage list = s.poolBooks[id];
         uint256 n = list.length;
         if (n == 0) return;
-        (int24 live, int24 sPrev,, bool ok) = _observe(s, f.token, f.quote);
+        (int24 live, int24 sPrev,, bool ok) = LadderRefs.observe(s, f.token, f.quote);
         if (!ok) return;
         uint256 m = n < s.p.shieldMax ? n : s.p.shieldMax;
         address[] memory pick = new address[](m);
@@ -718,8 +559,12 @@ library LadderLogic {
         }
         s.shieldCursor = start + m;
         // oriented edges: asks must sit at token prices >= askRef, bids at <= bidRef
-        int24 askE = f.tokenIs0 ? _max(live, sPrev) : -_max(live, sPrev);
-        int24 bidE = f.tokenIs0 ? _min(live, sPrev) : -_min(live, sPrev);
+        // ranges may sit (pool fee + tip) toward the taker of the reference: arbers keep that edge
+        int24 give = int24(uint24(key.fee / 100)) + s.p.tipTicks;
+        int24 askP = _max(live, sPrev) - give;
+        int24 bidP = _min(live, sPrev) + give;
+        int24 askE = f.tokenIs0 ? askP : -askP;
+        int24 bidE = f.tokenIs0 ? bidP : -bidP;
         for (uint256 i; i < m; ++i) {
             _shieldBook(s, key, id, f.tokenIs0, pick[i], askE, bidE);
         }

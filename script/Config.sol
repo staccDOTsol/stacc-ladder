@@ -6,7 +6,7 @@ import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {Currency} from "v4-core/types/Currency.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {Tier, Params} from "../src/LadderTypes.sol";
+import {Tier, Params, RatchetCfg, BurnCfg} from "../src/LadderTypes.sol";
 
 /// @notice Robinhood Chain (4663) addresses and the launch configuration.
 library Config {
@@ -16,6 +16,8 @@ library Config {
     address internal constant PONS_FACTORY = 0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e;
     address internal constant ZERO = 0x4cbCc4Eb02D7908B86627FBE434D09A506EC3522;
     address internal constant ZERO_CURVE = 0x5C8610B3225Dc9fe9671B549E3a88a01961C9b3D;
+    address internal constant JUSTTESTIN = 0xA0Fc5a405772Fc80e977e0C1E9D20B95FE956c9e;
+    address internal constant JUSTTESTIN_CURVE = 0xb6B77aB627d476Db286B732B7359F552BBC694F4;
 
     /// @notice afterInitialize, afterAdd(+delta), afterRemove(+delta), beforeSwap, afterSwap(+delta).
     uint160 internal constant FLAGS = Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
@@ -42,22 +44,34 @@ library Config {
         t[3] = Tier({fee: 100_000, spacing: 200});
     }
 
+    /// @notice v2 defaults from the backtest over 9 Pons curve histories: shield on with a
+    ///         (pool fee + 3%) edge, ranges ~35%, re-lay daily, typical volatility in the 1% tier.
     function params() internal pure returns (Params memory) {
         return Params({
-            tau: 600,
+            tau: 60,
             horizon: 3600,
-            feePerVol: 20,
+            feePerVol: 5,
             widthMult: 300,
-            minWidth: 600,
-            maxWidth: 60_000,
+            minWidth: 2_000,
+            maxWidth: 5_000,
             maxDev: 2_000,
             minVol: 50,
             initVol: 1_000,
-            interval: 900,
+            interval: 86_400,
             quoteDriftBps: 1_000,
             maxSlipBps: 100,
             shieldMax: 16,
-            stepGas: 8_000_000
+            stepGas: 3_000_000,
+            tipTicks: 300,
+            offsetTicks: 0
         });
+    }
+
+    function ratchet() internal pure returns (RatchetCfg memory) {
+        return RatchetCfg({floorPips: 1_000, kFree: 1, capPips: 1_000_000});
+    }
+
+    function burn() internal pure returns (BurnCfg memory) {
+        return BurnCfg({token: JUSTTESTIN, burnBps: 10_000, minBurnWei: 0.0002 ether});
     }
 }

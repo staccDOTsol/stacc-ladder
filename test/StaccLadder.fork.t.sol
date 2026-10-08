@@ -12,7 +12,7 @@ import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {Currency} from "v4-core/types/Currency.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {StaccLadder} from "../src/StaccLadder.sol";
-import {Pos} from "../src/LadderTypes.sol";
+import {Pos, Tier, BurnCfg} from "../src/LadderTypes.sol";
 import {Config} from "../script/Config.sol";
 import {Router, IERC20T} from "./Router.sol";
 
@@ -43,12 +43,11 @@ contract StaccLadderForkTest is Test {
         hook.listQuote(USDG, Config.usdgEthPool());
         hook.setPonsFactory(Config.PONS_FACTORY, true);
         hook.listPons(Config.ZERO_CURVE);
+        hook.listPons(Config.JUSTTESTIN_CURVE);
         router = new Router(pm);
         vm.deal(address(router), 50 ether);
-        vm.startPrank(WHALE);
-        zero.transfer(address(router), 20_000_000e18);
-        zero.transfer(bookA, 60_000_000e18);
-        vm.stopPrank();
+        deal(Config.ZERO, address(router), 20_000_000e18);
+        deal(Config.ZERO, bookA, 60_000_000e18);
         deal(Config.USDG, address(router), 100e6);
         deal(Config.USDG, bookA, 200e6);
         vm.deal(bookA, 1 ether);
@@ -57,7 +56,7 @@ contract StaccLadderForkTest is Test {
     function _deploy() internal returns (StaccLadder h) {
         bytes memory init = abi.encodePacked(
             type(StaccLadder).creationCode,
-            abi.encode(pm, address(this), address(this), uint16(0), Config.tiers(), Config.params())
+            abi.encode(pm, address(this), address(this), uint16(0), Config.tiers(), Config.params(), Config.ratchet(), Config.burn())
         );
         bytes32 ih = keccak256(init);
         uint256 salt;
@@ -160,13 +159,13 @@ contract StaccLadderForkTest is Test {
         PoolKey memory k = _usdgKey(1);
         Currency z = Currency.wrap(Config.ZERO);
         // buy ZERO with 2 USDG, exact in, three times in one block
-        uint256 t0 = hook.tollOf(z);
+        uint256 t0 = hook.burnableOf(z);
         BalanceDelta d1 = router.swap(k, false, -2e6);
-        uint256 t1 = hook.tollOf(z);
+        uint256 t1 = hook.burnableOf(z);
         BalanceDelta d2 = router.swap(k, false, -2e6);
-        uint256 t2 = hook.tollOf(z);
+        uint256 t2 = hook.burnableOf(z);
         BalanceDelta d3 = router.swap(k, false, -2e6);
-        uint256 t3 = hook.tollOf(z);
+        uint256 t3 = hook.burnableOf(z);
         assertEq(hook.referencesThisBlock(Config.ZERO), 3, "k");
         assertEq(t1 - t0, 0, "first reference free");
         uint256 out2 = uint256(uint128(d2.amount0()));
@@ -189,11 +188,11 @@ contract StaccLadderForkTest is Test {
         Router.Act[] memory a = new Router.Act[](2);
         a[0] = Router.Act(false, k, false, 1e15, lo, hi, bytes32(uint256(7)));
         a[1] = Router.Act(false, k, false, -1e15, lo, hi, bytes32(uint256(7)));
-        uint256 tz0 = hook.tollOf(Currency.wrap(Config.ZERO));
-        uint256 tu0 = hook.tollOf(USDG);
+        uint256 tz0 = hook.burnableOf(Currency.wrap(Config.ZERO));
+        uint256 tu0 = hook.burnableOf(USDG);
         BalanceDelta[] memory d = router.run(a);
-        uint256 tz = hook.tollOf(Currency.wrap(Config.ZERO)) - tz0;
-        uint256 tu = hook.tollOf(USDG) - tu0;
+        uint256 tz = hook.burnableOf(Currency.wrap(Config.ZERO)) - tz0;
+        uint256 tu = hook.burnableOf(USDG) - tu0;
         // add is k=1 (free); remove is k=2 plus one for the same block = 3 -> 90 bp of principal
         uint256 principal0 = uint256(uint128(d[1].amount0())) + tz;
         assertApproxEqRel(tz, principal0 * 90 / 10_000, 0.01e18, "same-block remove pays k=3");
@@ -260,8 +259,9 @@ contract StaccLadderForkTest is Test {
         Pos memory moved = hook.position(k.toId(), bookA, 0);
         console2.log("ask lo before", int256(before.lo));
         console2.log("ask lo after ", int256(moved.lo));
-        if (before.lo < ref1) {
-            assertGe(moved.lo, ref1, "ask moved behind the pumped reference");
+        int24 give = int24(uint24(k.fee / 100)) + Config.params().tipTicks;
+        if (before.lo < ref1 - give) {
+            assertGe(moved.lo, ref1 - give - k.tickSpacing, "ask moved to within the capped edge");
         }
     }
 
@@ -271,7 +271,7 @@ contract StaccLadderForkTest is Test {
         _laidOut();
         PoolKey memory k = _usdgKey(1);
         vm.roll(block.number + 1);
-        vm.warp(block.timestamp + 1000);
+        vm.warp(block.timestamp + 86_401);
         vm.recordLogs();
         router.swap(k, false, -1e6);
         router.swap(k, false, -1e6); // second swap reaches the next due entry
@@ -369,5 +369,129 @@ contract StaccLadderForkTest is Test {
         vm.roll(block.number + 1);
         vm.warp(block.timestamp + 5);
         hook.rebalance(bookA, Config.ZERO);
+    }
+}
+
+contract StaccLadderV2ForkTest is StaccLadderForkTest {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
+    address constant DEADADDR = 0x000000000000000000000000000000000000dEaD;
+    IERC20T jt = IERC20T(Config.JUSTTESTIN);
+
+    function test_v2_familyHasFeeTokenPools() public {
+        hook.openFamily(Config.ZERO);
+        for (uint8 t; t < 4; ++t) {
+            (PoolKey memory k,) = hook.familyKey(Config.ZERO, Currency.wrap(Config.JUSTTESTIN), t);
+            (uint160 sp,,,) = pm.getSlot0(k.toId());
+            assertGt(sp, 0, "ZERO/JUSTTESTIN tier opened");
+            assertTrue(hook.family(k.toId()).known, "registered");
+        }
+    }
+
+    function _tollZero() internal returns (uint256 burned) {
+        hook.setBurn(BurnCfg({token: Config.JUSTTESTIN, burnBps: 10_000, minBurnWei: 0}));
+        if (hook.bookPools(bookA).length == 0) _laidOut();
+        PoolKey memory k = _usdgKey(1);
+        deal(Config.USDG, address(router), 1_000e6);
+        Router.Act[] memory a = new Router.Act[](5);
+        for (uint256 i; i < 5; ++i) a[i] = Router.Act(true, k, false, -2e6, 0, 0, 0);
+        uint256 d0 = jt.balanceOf(DEADADDR);
+        router.run(a); // one transaction, five references: k = 1..5, toll burned inside the swaps
+        burned = jt.balanceOf(DEADADDR) - d0;
+    }
+
+    function test_v2_burnsTollInsideSwapsPreBond() public {
+        uint256 burned = _tollZero();
+        assertGt(burned, 0, "ZERO toll bought JUSTTESTIN on its curve and burned in the same tx");
+        console2.log("JUSTTESTIN burned pre-bond", burned);
+    }
+
+    function test_v2_feeTokenTollBurnsDirectly() public {
+        hook.openFamily(Config.JUSTTESTIN);
+        address[] memory toks = new address[](1);
+        toks[0] = Config.JUSTTESTIN;
+        deal(Config.JUSTTESTIN, bookA, 20_000_000e18);
+        Currency[] memory qs = new Currency[](1);
+        qs[0] = USDG;
+        vm.startPrank(bookA);
+        hook.setBook(toks, qs, address(0));
+        jt.approve(address(hook), 20_000_000e18);
+        hook.deposit(Currency.wrap(Config.JUSTTESTIN), 20_000_000e18);
+        usdg.approve(address(hook), 50e6);
+        hook.deposit(USDG, 50e6);
+        vm.stopPrank();
+        hook.rebalance(bookA, Config.JUSTTESTIN);
+        (PoolKey memory k,) = hook.familyKey(Config.JUSTTESTIN, USDG, 1);
+        Router.Act[] memory a = new Router.Act[](4);
+        hook.setBurn(BurnCfg({token: Config.JUSTTESTIN, burnBps: 10_000, minBurnWei: 1000 ether}));
+        for (uint256 i; i < 4; ++i) a[i] = Router.Act(true, k, true, -1e6, 0, 0, 0); // pay USDG, take JUSTTESTIN
+        router.run(a);
+        Currency j = Currency.wrap(Config.JUSTTESTIN);
+        uint256 pending = hook.burnableOf(j);
+        assertGt(pending, 0, "JUSTTESTIN toll held (below the in-swap minimum)");
+        hook.setBurn(BurnCfg({token: Config.JUSTTESTIN, burnBps: 10_000, minBurnWei: 0}));
+        uint256 d0 = jt.balanceOf(DEADADDR);
+        hook.burnToll(j);
+        assertEq(jt.balanceOf(DEADADDR) - d0, pending, "burned as is, no swap");
+    }
+
+    function test_v2_burnsTollInsideSwapsPostBond() public {
+        _laidOut();
+        // JUSTTESTIN graduates: sweep, then anyone seeds its Uniswap pool
+        address buyer = makeAddr("grad");
+        vm.deal(buyer, 10 ether);
+        vm.prank(buyer);
+        IPonsCurveT(Config.JUSTTESTIN_CURVE).buy{value: 5 ether}(5 ether, 0, buyer);
+        assertTrue(IPonsCurveT(Config.JUSTTESTIN_CURVE).graduated(), "graduated");
+        (bool seeded,) = Config.PONS_FACTORY.call(abi.encodeWithSignature("createGraduatedPool(address)", Config.JUSTTESTIN));
+        assertTrue(seeded, "seeded");
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 120);
+        (, bool ok) = hook.pairTick(Config.JUSTTESTIN, ETH);
+        assertTrue(ok, "fee token priced by its Uniswap pool");
+        uint256 burned = _tollZero();
+        assertGt(burned, 0, "bought in the Uniswap pool and burned in the same tx");
+        console2.log("JUSTTESTIN burned post-bond", burned);
+    }
+
+    function test_v2_ownerSetters() public {
+        address x = makeAddr("x");
+        vm.startPrank(x);
+        vm.expectRevert(StaccLadder.NotOwner.selector);
+        hook.setParams(Config.params());
+        vm.expectRevert(StaccLadder.NotOwner.selector);
+        hook.setRatchet(Config.ratchet());
+        vm.expectRevert(StaccLadder.NotOwner.selector);
+        hook.setBurn(Config.burn());
+        vm.expectRevert(StaccLadder.NotOwner.selector);
+        hook.setTiers(Config.tiers());
+        vm.expectRevert(StaccLadder.NotOwner.selector);
+        hook.delistQuote(USDG);
+        vm.expectRevert(StaccLadder.NotOwner.selector);
+        hook.setPonsRef(Config.ZERO, Config.ZERO_CURVE);
+        vm.expectRevert(StaccLadder.NotOwner.selector);
+        hook.clearRef(Config.ZERO);
+        vm.expectRevert(StaccLadder.NotOwner.selector);
+        hook.setBeneficiary(x, 0);
+        vm.expectRevert(StaccLadder.NotOwner.selector);
+        hook.transferOwnership(x);
+        vm.stopPrank();
+        hook.setRatchet(Config.ratchet());
+        assertEq(hook.ratchetCfg().floorPips, 1_000);
+    }
+
+    function test_v2_tierChangeDoesNotStrand() public {
+        _laidOut();
+        uint256 n = hook.bookPools(bookA).length;
+        assertGt(n, 0, "book tracks its pools");
+        Tier[] memory t = new Tier[](1);
+        t[0] = Tier({fee: 5_000, spacing: 50});
+        hook.setTiers(t);
+        vm.prank(bookA);
+        hook.unwind(bookA, Config.ZERO);
+        (uint256 z,,) = hook.balanceOf(bookA, Currency.wrap(Config.ZERO));
+        assertApproxEqRel(z, 50_000_000e18, 0.0001e18, "all ZERO back after the tier change");
+        assertEq(hook.bookPools(bookA).length, 0, "no positions left");
     }
 }

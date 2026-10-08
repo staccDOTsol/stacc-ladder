@@ -70,6 +70,8 @@ struct Book {
     mapping(address => uint64) lastRebalance;
     address operator;
     bool exists;
+    PoolId[] pools; // every pool this book holds a position in
+    mapping(PoolId => uint256) poolIdx; // 1-based
 }
 
 struct Due {
@@ -92,6 +94,24 @@ struct Params {
     uint16 maxSlipBps; // max price move of a quote-rebalance swap
     uint8 shieldMax; // books the shield may move per swap
     uint32 stepGas; // gas handed to each in-swap step
+    int24 tipTicks; // shield: ranges may sit (pool fee + tipTicks) toward the taker of the reference
+    int24 offsetTicks; // re-lay: edge distance from the reference, away from the taker (negative = toward)
+}
+
+/// @notice The EIP-8429 fee ratchet: the k-th reference to a token in a block pays
+///         floorPips * k^2 (capped at capPips), the first kFree references free.
+struct RatchetCfg {
+    uint32 floorPips;
+    uint8 kFree;
+    uint32 capPips;
+}
+
+/// @notice The hook's fee token: toll is converted to it and burned (burnBps of each toll),
+///         and every token family also gets pools against it.
+struct BurnCfg {
+    address token;
+    uint16 burnBps;
+    uint128 minBurnWei; // burn a currency's pending toll only once it is worth this much ETH
 }
 
 struct State {
@@ -118,4 +138,11 @@ struct State {
     mapping(bytes32 => bool) isDue;
     uint256 dueCursor;
     uint256 shieldCursor;
+    RatchetCfg rc;
+    BurnCfg burn;
+    mapping(PoolId => PoolKey) keyOf;
+    mapping(Currency => uint256) burnable;
+    Currency[] tollCurrencies;
+    mapping(Currency => bool) isTollCurrency;
+    uint256 burnCursor;
 }
