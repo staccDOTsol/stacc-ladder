@@ -8,13 +8,15 @@ A Uniswap v4 hook on Robinhood Chain (4663). For every token it trades, it opens
 
 | | |
 |---|---|
-| StaccLadder (hook) | [`0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7`](https://robinhoodchain.blockscout.com/address/0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7) |
-| LadderLogic (linked library) | [`0x80Cb4F20E3d75Db82380827ABD5CD18a6aedfa36`](https://robinhoodchain.blockscout.com/address/0x80Cb4F20E3d75Db82380827ABD5CD18a6aedfa36) |
+| StaccLadder (hook) | [`0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7`](https://robin.etherscan.io/address/0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7#code) |
+| LadderLogic (linked library) | [`0x80Cb4F20E3d75Db82380827ABD5CD18a6aedfa36`](https://robin.etherscan.io/address/0x80Cb4F20E3d75Db82380827ABD5CD18a6aedfa36#code) |
 | PoolManager (canonical v4) | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
 | Quotes | native ETH; USDG `0x5fc5…d168`, priced by the ETH/USDG pool (fee 460, spacing 9, no hook) |
 | Pons factory (allowed) | `0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e` |
 
 The full record is in [`deployments/robinhood-4663.json`](deployments/robinhood-4663.json).
+
+Source is verified (exact match) on [Sourcify](https://repo.sourcify.dev/4663/0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7) and [robin.etherscan.io](https://robin.etherscan.io/address/0x3BDAd0B539F815eDE3ff89cF511F2C37f99215C7#code).
 
 ## What it does
 
@@ -42,24 +44,29 @@ The full record is in [`deployments/robinhood-4663.json`](deployments/robinhood-
 
 **Placement never moves toward a taker.** Asks sit at or above the highest of the pool price, the live reference and the smoothed reference. Bids sit at or below the lowest of them. The smoothed reference is from earlier blocks only. A rebalance refuses to place a pair when live and smoothed disagree by more than `maxDev` ticks. Pushing a reference within one transaction can therefore only make a book's quotes worse for whoever pushed it.
 
-**The shield (LVR).** Before every swap into a pool that holds books, the hook moves untouched single-sided ranges that the reference has run past back behind it. It moves up to `shieldMax` books per swap, rotating. The swap must carry `stepGas` for this step, or it reverts, so a low-gas swap can't skip it.
+**The shield (LVR, off on the live hook, see Parameters).** Before every swap into a pool that holds books, the hook moves untouched single-sided ranges that the reference has run past back behind it. It moves up to `shieldMax` books per swap, rotating. The swap must carry `stepGas` for this step, or it reverts, so a low-gas swap can't skip it.
 
 **Orchestration.** After every swap, the hook runs one bounded step: the next due (book, token) is re-laid if `interval` has passed, or the book's quote mix if that entry is the quote mix. A failed step is skipped and never reverts the swap. Anyone can also call `rebalance(book, token)` or `rebalanceQuotes(book)`.
 
-## Parameters at deploy
+## Parameters
 
-| | |
-|---|---|
-| tau (smoothing) | 600 s |
-| horizon (sigma) | 3600 s |
-| feePerVol | 20 pips per tick of sigma |
-| widthMult | 3.00 x sigma |
-| min / max width | 600 / 60000 ticks |
-| maxDev | 2000 ticks |
-| minVol / initVol | 50 / 1000 ticks |
-| interval | 900 s |
-| quoteDriftBps / maxSlipBps | 1000 / 100 |
-| shieldMax / stepGas | 16 / 8,000,000 |
+| | at deploy | live since 2026-10-08 09:20 UTC |
+|---|---|---|
+| tau (smoothing) | 600 s | 600 s |
+| horizon (sigma) | 3600 s | 3600 s |
+| feePerVol | 20 pips per tick of sigma | same |
+| widthMult | 3.00 x sigma | same |
+| min / max width | 600 / 60000 ticks | same |
+| maxDev | 2000 ticks | same |
+| minVol / initVol | 50 / 1000 ticks | same |
+| interval (auto re-lay) | 900 s | **300 s** |
+| quoteDriftBps / maxSlipBps | 1000 / 100 | same |
+| shieldMax / stepGas | 16 / 8,000,000 | **0 / 3,000,000** |
+| sinkBps | 0 (all toll to the beneficiary) | same |
+
+**The shield is off on the live hook (`shieldMax` = 0).** With it on, every swap moved a book's stale asks and bids behind the reference before filling. That left arbers no edge, so no arbers came. With it off, the gap between the Pons curve and a book is a real arb, bounded by how far the curve moved since the last re-lay (at most `interval`). Arbers pay the pool fee, and the fee ratchet on repeat references. The cost is that books sell into a pump below the curve by up to that gap. `stepGas` still funds the in-swap re-lay step, so a swap into a pool with books needs `stepGas + 150k` gas available.
+
+`arb.sh` (with `src/arb/PonsArb.sol`) is a flash-funded Pons curve <-> v4 pool arbitrage for any token. It needs no capital, and the contract reverts any fill that would not pay.
 
 The owner can change parameters, the beneficiary and sink share, the Pons factory allowlist, references for non-Pons tokens, and the pricing pool of an already-listed quote. Anyone can list a new quote.
 
