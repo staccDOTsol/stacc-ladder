@@ -79,7 +79,15 @@ def label(addr):
     return a[:10]
 
 
-def emit(line):
+SEEN = set()
+
+
+def emit(line, key=None):
+    # a rate-limited poll retries its block range; never report the same log twice
+    if key is not None:
+        if key in SEEN:
+            return
+        SEEN.add(key)
     print(line, flush=True)
 
 
@@ -110,7 +118,7 @@ while True:
                 tok_amt, q_amt = (a0, a1) if tok0 else (a1, a0)
                 side = "BUY " if tok_amt > 0 else "SELL"  # PoolManager delta is the swapper's: + = received
                 tx = rpc("eth_getTransactionByHash", [l["transactionHash"]])
-                emit(f"SWAP {side} {name}/{qn} {fee}: token {abs(tok_amt)/1e18:,.0f} quote {abs(q_amt)/(1e6 if qn=='USDG' else 1e18):,.6f} "
+                emit(key=(l["transactionHash"], l["logIndex"]), line=f"SWAP {side} {name}/{qn} {fee}: token {abs(tok_amt)/1e18:,.0f} quote {abs(q_amt)/(1e6 if qn=='USDG' else 1e18):,.6f} "
                      f"from {label(tx['from'])} via {label(tx['to'] or '')} tx {l['transactionHash'][:14]} blk {int(l['blockNumber'],16)}")
             for l in rpc("eth_getLogs", [{"address": HOOK, "fromBlock": frm, "toBlock": to}]):
                 ev = HOOKEV.get(l["topics"][0])
@@ -118,9 +126,9 @@ while True:
                     d = l["data"][2:]
                     kk = int(d[64:128], 16); t0 = int(d[128:192], 16); t1 = int(d[192:256], 16)
                     if t0 or t1:
-                        emit(f"HOOK toll k={kk} amounts {t0} / {t1} tx {l['transactionHash'][:14]}")
+                        emit(f"HOOK toll k={kk} amounts {t0} / {t1} tx {l['transactionHash'][:14]}", (l["transactionHash"], l["logIndex"]))
                 elif ev and ev != "Deposit":
-                    emit(f"HOOK {ev} tx {l['transactionHash'][:14]} blk {int(l['blockNumber'],16)}")
+                    emit(f"HOOK {ev} tx {l['transactionHash'][:14]} blk {int(l['blockNumber'],16)}", (l["transactionHash"], l["logIndex"]))
             for pos in (2, 3):
                 topics = [INIT, None, None, None]
                 topics[pos] = tok_topics
@@ -130,7 +138,7 @@ while True:
                     if hooks.lower() == HOOK.lower():
                         continue
                     tx = rpc("eth_getTransactionByHash", [l["transactionHash"]])
-                    emit(f"NEWPOOL by {label(tx['from'])} fee {int(d[0:64],16)} hook {hooks[:10]} tx {l['transactionHash'][:14]}")
+                    emit(f"NEWPOOL by {label(tx['from'])} fee {int(d[0:64],16)} hook {hooks[:10]} tx {l['transactionHash'][:14]}", (l["transactionHash"], l["logIndex"]))
             last = n
         if time.time() >= next_hb:
             heartbeat()
